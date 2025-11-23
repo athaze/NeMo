@@ -130,6 +130,165 @@ class MultiTaskTranscriptionConfig(TranscribeConfig):
         self.prompt = parse_multitask_prompt(self.prompt)
 
 
+class VocabExpansion:
+    """
+    Helper class to perform 'weight surgery' on Canary/EncDecMultiTaskModel.
+    It preserves the original pre-trained embeddings while adding new random 
+    embeddings for the extended vocabulary.
+    """
+    def expand(
+        self,
+        model, 
+        new_tokenizer_dir: Union[str, DictConfig],
+        new_tokenizer_type: str,
+        decoding_cfg: Optional[DictConfig] = None,
+        prompt_format: Optional[str] = None,
+    ):
+        logging.info(f"Starting VocabExpansion surgery for model type: {type(model).__name__}")
+
+        # 1. Parse Tokenizer Config (Logic from original change_vocabulary)
+        if isinstance(new_tokenizer_dir, (dict, DictConfig)):
+            if new_tokenizer_type == 'agg':
+                if not isinstance(new_tokenizer_dir, DictConfig):
+                    new_tokenizer_dir = OmegaConf.create(new_tokenizer_dir)
+                new_tokenizer_cfg = new_tokenizer_dir
+            else:
+                raise ValueError(f'New tokenizer dir should be a string unless the tokenizer is `agg`.')
+        else:
+            new_tokenizer_cfg = None
+
+        if new_tokenizer_cfg is None:
+            if not os.path.isdir(new_tokenizer_dir):
+                raise NotADirectoryError(f'New tokenizer dir must be non-empty path: {new_tokenizer_dir}')
+            if new_tokenizer_type.lower() not in ('bpe', 'wpe'):
+                raise ValueError('New tokenizer type must be either `bpe` or `wpe`')
+            tokenizer_cfg = OmegaConf.create({'dir': new_tokenizer_dir, 'type': new_tokenizer_type})
+        else:
+            tokenizer_cfg = new_tokenizer_cfg
+
+        if prompt_format is None:
+            prompt_format = model.cfg.prompt_format
+
+        # 2. Setup the new Tokenizer on the model
+        model._setup_tokenizer(tokenizer_cfg)
+        
+        # 3. Calculate New Vocab Size (Pad to 8)
+        vocab_size = 8 * ceil(model.tokenizer.vocab_size / 8)
+        logging.info(f"New Vocabulary Size: {vocab_size} (padded to multiple of 8)")
+
+        # 4. Prepare Decoder Configuration
+        transf_decoder_cfg_dict = model.transf_decoder.to_config_dict()
+        with open_dict(transf_decoder_cfg_dict):
+            if 'config_dict' in transf_decoder_cfg_dict:
+                transf_decoder_cfg_dict['config_dict']['vocab_size'] = vocab_size
+
+        # 5. Save Original State Dict
+        original_decoder_state_dict = model.transf_decoder.state_dict()
+        
+        # 6. Re-initialize Decoder (Creates NEW larger random matrix)
+        # We use model.__class__ to instantiate the sub-module safely
+        model.transf_decoder = model.__class__.from_config_dict(transf_decoder_cfg_dict)
+        new_decoder_state_dict = model.transf_decoder.state_dict()
+
+        # 7. PERFORM WEIGHT SPLICING (The Fix)
+        # This function copies old weights into the top of the new matrix
+        final_state_dict = self._splice_weights(
+            old_state_dict=original_decoder_state_dict, 
+            new_state_dict=new_decoder_state_dict,
+            module_name="transf_decoder"
+        )
+        model.transf_decoder.load_state_dict(final_state_dict)
+
+        # 8. Setup Token Classifier (Log Softmax)
+        with open_dict(model.cfg.head):
+            model.cfg.head.num_classes = vocab_size
+
+        del model.log_softmax
+        model.log_softmax = model.__class__.from_config_dict(model.cfg.head)
+
+        # Weight tying - specific to TokenClassifier
+        if isinstance(model.log_softmax, TokenClassifier):
+            model.log_softmax.mlp.layer0.weight = model.transf_decoder.embedding.token_embedding.weight
+
+        # Init weights for head
+        std_init_range = 1 / model.cfg.model_defaults.lm_dec_hidden**0.5
+        model.log_softmax.apply(lambda module: transformer_weights_init(module, std_init_range))
+
+        # 9. Setup Decoding Config
+        if decoding_cfg is None:
+            decoding_cfg = model.cfg.decoding
+
+        decoding_cls = OmegaConf.structured(MultiTaskDecodingConfig)
+        decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
+        decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
+
+        del model.decoding
+        model.decoding = MultiTaskDecoding(
+            decoding_cfg=decoding_cfg,
+            transformer_decoder=model.transf_decoder,
+            log_softmax_module=model.log_softmax,
+            tokenizer=model.tokenizer,
+        )
+
+        # Update Metrics and Configs
+        model.metric = MultiTaskMetric(model=model, cfg=model.metric_cfg)
+
+        with open_dict(model.cfg.decoding):
+            model.cfg.decoding = decoding_cfg
+
+        with open_dict(model.cfg.loss):
+            model.cfg.loss.pad_id = model.tokenizer.pad_id
+
+        del model.loss
+        model.loss = model.__class__.from_config_dict(model.cfg.loss)
+
+        with open_dict(model.cfg):
+            model.cfg.prompt_format = prompt_format
+
+        logging.info(f"VocabExpansion Complete. Model now outputs to {vocab_size} tokens.")
+        return model
+
+    def _splice_weights(self, old_state_dict, new_state_dict, module_name=""):
+        """
+        Intelligently copies weights. If shapes match, copy directly.
+        If shapes mismatch only on dim 0 (vocab expansion), copy old weights to the top.
+        """
+        for key, new_param in new_state_dict.items():
+            if key not in old_state_dict:
+                continue
+
+            old_param = old_state_dict[key]
+
+            # Case 1: Exact Match
+            if old_param.shape == new_param.shape:
+                new_state_dict[key] = old_param
+            
+            # Case 2: Vocab Expansion Mismatch (Dim 0)
+            # Example: Old [128000, 768] vs New [129024, 768]
+            elif (len(old_param.shape) == len(new_param.shape) and 
+                  old_param.shape[0] < new_param.shape[0] and
+                  old_param.shape[1:] == new_param.shape[1:]):
+                
+                old_vocab_len = old_param.shape[0]
+                # Copy the old pre-trained weights into the top of the new tensor
+                new_state_dict[key][:old_vocab_len] = old_param
+                logging.info(f"[{module_name}] Spliced {key}: Copied {old_vocab_len} rows. Rest initialized randomly.")
+            
+            # Case 3: Bias Mismatch (1D tensor)
+            elif (len(old_param.shape) == 1 and len(new_param.shape) == 1 and
+                  old_param.shape[0] < new_param.shape[0]):
+                 
+                 old_vocab_len = old_param.shape[0]
+                 new_state_dict[key][:old_vocab_len] = old_param
+                 logging.info(f"[{module_name}] Spliced bias {key}: Copied {old_vocab_len} elements.")
+
+            else:
+                logging.warning(f"[{module_name}] Skipping key `{key}` due to incompatible shapes: {old_param.shape} vs {new_param.shape}")
+        
+        return new_state_dict
+        
+
+
 class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModuleMixin, ASRTranscriptionMixin):
     """Base class for AED multi-task models"""
 
@@ -303,162 +462,16 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             from pre-trained model. This method changes only decoder and leaves encoder and pre-processing
             modules unchanged.
             
-            **UPDATED:** This method now performs 'Weight Splicing'. It detects if the vocab size 
-            increased and copies the old pre-trained weights into the new larger matrices 
-            instead of re-initializing them randomly.
+            Uses VocabExpansion helper to perform weight splicing (preserving old embeddings).
             """
-            # ---------------------------------------------------------
-            # 1. SETUP TOKENIZER CONFIG (Unchanged)
-            # ---------------------------------------------------------
-            if isinstance(new_tokenizer_dir, (dict, DictConfig)):
-                if new_tokenizer_type == 'agg':
-                    if not isinstance(new_tokenizer_dir, DictConfig):
-                        new_tokenizer_dir = OmegaConf.create(new_tokenizer_dir)
-                    new_tokenizer_cfg = new_tokenizer_dir
-                else:
-                    raise ValueError(
-                        f'New tokenizer dir should be a string unless the tokenizer is `agg`, but this '
-                        f'tokenizer type is: {new_tokenizer_type}'
-                    )
-            else:
-                new_tokenizer_cfg = None
-    
-            if new_tokenizer_cfg is not None:
-                tokenizer_cfg = new_tokenizer_cfg
-            else:
-                if not os.path.isdir(new_tokenizer_dir):
-                    raise NotADirectoryError(
-                        f'New tokenizer dir must be non-empty path to a directory. But instead got: {new_tokenizer_dir}'
-                    )
-                if new_tokenizer_type.lower() not in ('bpe', 'wpe'):
-                    raise ValueError('New tokenizer type must be either `bpe` or `wpe`')
-                tokenizer_cfg = OmegaConf.create({'dir': new_tokenizer_dir, 'type': new_tokenizer_type})
-    
-            if prompt_format is None:
-                prompt_format = self.cfg.prompt_format
-    
-            # Setup the tokenizer
-            self._setup_tokenizer(tokenizer_cfg)
-    
-            # Initialize a dummy vocabulary for logging
-            vocabulary = self.tokenizer.tokenizer.get_vocab()
-    
-            # ---------------------------------------------------------
-            # 2. SETUP DECODER ARCHITECTURE
-            # ---------------------------------------------------------
-            transf_decoder_cfg_dict = self.transf_decoder.to_config_dict()
-            
-            # Calculate new vocab size (padded to 8)
-            vocab_size = 8 * ceil(self.tokenizer.vocab_size / 8)
-    
-            # Auto inject vocab size for `get_transformer`
-            with open_dict(transf_decoder_cfg_dict):
-                if 'config_dict' in transf_decoder_cfg_dict:
-                    transf_decoder_cfg_dict['config_dict']['vocab_size'] = vocab_size
-    
-            original_decoder_state_dict = self.transf_decoder.state_dict()
-            
-            # Re-initialize the decoder with the NEW size (Random weights)
-            self.transf_decoder = EncDecMultiTaskModel.from_config_dict(transf_decoder_cfg_dict)
-            
-            # ---------------------------------------------------------
-            # 3. WEIGHT SPLICING (THE FIX)
-            # ---------------------------------------------------------
-            decoder_state_dict = self.transf_decoder.state_dict()
-            
-            for og_key, og_value in original_decoder_state_dict.items():
-                if og_key not in decoder_state_dict:
-                    continue
-                
-                new_param = decoder_state_dict[og_key]
-    
-                # Case A: Shapes match perfectly (Layers unrelated to vocab size)
-                if og_value.shape == new_param.shape:
-                    decoder_state_dict[og_key] = og_value
-                
-                # Case B: Dimension 0 Mismatch (Vocab Expansion - e.g. Embeddings)
-                # We copy the old weights to the top, leave the rest random
-                elif (len(og_value.shape) == len(new_param.shape) and 
-                      og_value.shape[0] < new_param.shape[0] and
-                      og_value.shape[1:] == new_param.shape[1:]):
-                    
-                    old_vocab_dim = og_value.shape[0]
-                    decoder_state_dict[og_key][:old_vocab_dim] = og_value
-                    logging.info(
-                        f"Spliced weights for `{og_key}`. Copied {old_vocab_dim} rows. "
-                        "Preserved pre-trained knowledge."
-                    )
-    
-                # Case C: 1D Tensor Mismatch (Biases)
-                elif (len(og_value.shape) == 1 and len(new_param.shape) == 1 and
-                      og_value.shape[0] < new_param.shape[0]):
-                     
-                     old_vocab_dim = og_value.shape[0]
-                     decoder_state_dict[og_key][:old_vocab_dim] = og_value
-                     logging.info(f"Spliced bias for `{og_key}`.")
-    
-                else:
-                    logging.warning(
-                        f"Skipping key `{og_key}` due to incompatible shapes. "
-                        f"Original: {og_value.shape}, New: {new_param.shape}"
-                    )
-    
-            self.transf_decoder.load_state_dict(decoder_state_dict)
-    
-            # ---------------------------------------------------------
-            # 4. SETUP HEAD & REST (Unchanged)
-            # ---------------------------------------------------------
-            # Setup token classifier
-            with open_dict(self.cfg.head):
-                self.cfg.head.num_classes = vocab_size
-    
-            del self.log_softmax
-            self.log_softmax = EncDecMultiTaskModel.from_config_dict(self.cfg.head)
-    
-            # Weight tying - if using TokenClassifier only
-            if isinstance(self.log_softmax, TokenClassifier):
-                self.log_softmax.mlp.layer0.weight = self.transf_decoder.embedding.token_embedding.weight
-    
-            # Initialize weights of token classifier
-            std_init_range = 1 / self.cfg.model_defaults.lm_dec_hidden**0.5
-            self.log_softmax.apply(lambda module: transformer_weights_init(module, std_init_range))
-    
-            # Setup Decoding class
-            if decoding_cfg is None:
-                # Assume same decoding config as before
-                decoding_cfg = self.cfg.decoding
-    
-            # Assert the decoding config with all hyper parameters
-            decoding_cls = OmegaConf.structured(MultiTaskDecodingConfig)
-            decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
-            decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
-    
-            del self.decoding
-            self.decoding = MultiTaskDecoding(
+            vocab_expander = VocabExpansion()
+            vocab_expander.expand(
+                model=self,
+                new_tokenizer_dir=new_tokenizer_dir,
+                new_tokenizer_type=new_tokenizer_type,
                 decoding_cfg=decoding_cfg,
-                transformer_decoder=self.transf_decoder,
-                log_softmax_module=self.log_softmax,
-                tokenizer=self.tokenizer,
+                prompt_format=prompt_format
             )
-    
-            # Update metric logger
-            self.metric = MultiTaskMetric(model=self, cfg=self.metric_cfg)
-    
-            with open_dict(self.cfg.decoding):
-                self.cfg.decoding = decoding_cfg
-    
-            # Setup loss
-            with open_dict(self.cfg.loss):
-                self.cfg.loss.pad_id = self.tokenizer.pad_id
-    
-            del self.loss
-            self.loss = EncDecMultiTaskModel.from_config_dict(self.cfg.loss)
-    
-            # Update config
-            with open_dict(self.cfg):
-                self.cfg.prompt_format = prompt_format
-    
-            logging.info(f"Changed decoder to output to {len(vocabulary)} vocabulary items (padded to {vocab_size}).")
 
     def change_prompt(
         self, prompt_format: Optional[str] = None, prompt_defaults: Optional[List[Dict[str, Any]]] = None
